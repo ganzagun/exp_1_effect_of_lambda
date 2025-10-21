@@ -17,6 +17,7 @@ from data_preprocess import (
 )
 from ogb.nodeproppred import DglNodePropPredDataset
 import networkx as nx
+from dgl.data import ActorDataset
 
 CPF_data = ["cora", "citeseer", "pubmed", "a-computer", "a-photo"]
 OGB_data = ["ogbn-arxiv", "ogbn-products"]
@@ -33,10 +34,20 @@ def load_data(dataset, dataset_path, **kwargs):
         )
     elif dataset in OGB_data:
         return load_ogb_data(dataset, dataset_path)
-    else:
+    elif dataset = 'actor':
+        return load_actor_data(
+            dataset, 
+            dataset_path,
+            kwargs["seed"],
+            kwargs["labelrate_train"],
+            kwargs["labelrate_val"]
+        )
+    else
         raise ValueError(f"Unknown dataset: {dataset}")
 
 
+def load_actor(dataset, dataset_path):
+    
 def load_graph(graph_path):
     """
     Reading a NetworkX graph.
@@ -123,6 +134,75 @@ def load_cpf_data(dataset, dataset_path, seed, labelrate_train, labelrate_val):
     idx_val = torch.LongTensor(idx_val)
     idx_test = torch.LongTensor(idx_test)
     return g, labels, idx_train, idx_val, idx_test
+
+
+def load_actor_data(dataset, dataset_path, seed, labelrate_train, labelrate_val) 
+    """
+    Load Actor dataset (prefers {dataset}.npz in dataset_path, else loads DGL ActorDataset).
+    Returns:
+        g: DGLGraph
+        labels: torch.LongTensor (n,)
+        idx_train, idx_val, idx_test: torch.LongTensor
+    """
+    # Try to load .npz like your CPF loader expects
+    data_path = Path.cwd().joinpath(dataset_path, f"{dataset}.npz")
+
+    ds = ActorDataset()
+    g0 = ds[0]
+    # ensure graph is undirected and has self-loops
+    g0 = dgl.to_simple(dgl.to_bidirected(g0))
+    g0 = dgl.remove_self_loop(g0)
+    g0 = dgl.add_self_loop(g0)
+
+    # build scipy sparse adj from edges
+    src, dst = g0.edges()
+    src = src.numpy()
+    dst = dst.numpy()
+    n_nodes = g0.num_nodes()
+    adj = sp.coo_matrix((np.ones_like(src), (src, dst)), shape=(n_nodes, n_nodes)).tocsr()
+
+    # features and labels
+    features = g0.ndata.get("feat")
+    if isinstance(features, torch.Tensor):
+        features = features.numpy()
+    labels_arr = g0.ndata.get("label")
+    if isinstance(labels_arr, torch.Tensor):
+        labels_arr = labels_arr.numpy().squeeze()
+
+    # standardize-like step: remove isolated nodes? For parity with CPF we skip heavy processing,
+    # but ensure shapes are correct.
+    if sp.issparse(adj) is False:
+        adj = sp.csr_matrix(adj)
+
+    # Binarize labels -> one-hot for splitting routine
+    labels_onehot = binarize_labels(labels_arr)
+
+    # deterministic splits
+    rng = np.random.RandomState(seed)
+    idx_train_list, idx_val_list, idx_test_list = get_train_val_test_split(
+        rng, labels_onehot, labelrate_train, labelrate_val
+    )
+
+    # Normalize adjacency and rebuild DGL graph (mirrors CPF pipeline)
+    adj_norm = normalize_adj(adj)  # returns coo
+    adj_sp = adj_norm.tocoo()
+    g = dgl.graph((adj_sp.row.astype(np.int64), adj_sp.col.astype(np.int64)), num_nodes=adj_sp.shape[0])
+
+    # Features -> torch.FloatTensor
+    if sp.issparse(features):
+        features = features.todense()
+    features = np.array(features)
+    g.ndata["feat"] = torch.FloatTensor(features)
+
+    # Labels returned as LongTensor of class indices (not one-hot)
+    labels_tensor = torch.LongTensor(np.array(labels_arr).astype(np.int64).reshape(-1))
+
+    # Index tensors
+    idx_train = torch.LongTensor(idx_train_list)
+    idx_val = torch.LongTensor(idx_val_list)
+    idx_test = torch.LongTensor(idx_test_list)
+
+    return g, labels_tensor, idx_train, idx_val, idx_test
 
 
 def rand_train_test_idx(label, train_prop=.5, valid_prop=.25, ignore_negative=True):

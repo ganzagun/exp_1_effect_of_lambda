@@ -18,6 +18,7 @@ from data_preprocess import (
 from ogb.nodeproppred import DglNodePropPredDataset
 import networkx as nx
 from dgl.data import ActorDataset
+from dgl.data import FraudAmazonDataset
 
 CPF_data = ["cora", "citeseer", "pubmed", "a-computer", "a-photo"]
 OGB_data = ["ogbn-arxiv", "ogbn-products"]
@@ -204,6 +205,83 @@ def load_actor_data(dataset, dataset_path, seed, labelrate_train, labelrate_val)
 
     return g, labels_tensor, idx_train, idx_val, idx_test
 
+
+def load_fraudamazon_data(dataset: str, dataset_path: str, seed: int, labelrate_train, labelrate_val):
+    """
+    Load FraudAmazon graph dataset.
+
+    Parameters
+    ----------
+    dataset : str
+        Name used for npz filename (e.g., "fraud_amazon" or "amazon_fraud").
+    dataset_path : str
+        Directory containing `{dataset}.npz`. If not present, the function will attempt to use DGL's FraudAmazonDataset.
+    seed : int
+        Random seed for deterministic splits.
+    labelrate_train, labelrate_val : float in (0,1] or int >=1
+        Fraction-per-class or absolute number-per-class for train/val labelled nodes.
+
+    Returns
+    -------
+    g : dgl.DGLGraph
+        Graph built from normalized adjacency (A_hat = D^-1/2 (A+I) D^-1/2).
+    labels : torch.LongTensor
+        Node labels as integers (n,).
+    idx_train, idx_val, idx_test : torch.LongTensor
+        Index tensors for splits.
+    """
+    ds = FraudAmazonDataset()
+    g0 = ds[0]
+    # make undirected / simple and add self-loops
+    g0 = dgl.to_simple(dgl.to_bidirected(g0))
+    g0 = dgl.remove_self_loop(g0)
+    g0 = dgl.add_self_loop(g0)
+
+    src, dst = g0.edges()
+    src = src.numpy()
+    dst = dst.numpy()
+    n_nodes = g0.num_nodes()
+    adj = sp.coo_matrix((np.ones_like(src), (src, dst)), shape=(n_nodes, n_nodes)).tocsr()
+
+    features = g0.ndata.get("feat")
+    if isinstance(features, torch.Tensor):
+        features = features.numpy()
+    labels_arr = g0.ndata.get("label")
+    if isinstance(labels_arr, torch.Tensor):
+        labels_arr = labels_arr.numpy().squeeze()
+
+    # ensure CSR
+    if not sp.issparse(adj):
+        adj = sp.csr_matrix(adj)
+
+    # binarize (one-hot) for split routine
+    labels_onehot = binarize_labels(labels_arr)
+
+    rng = np.random.RandomState(seed)
+    idx_train_list, idx_val_list, idx_test_list = get_train_val_test_split(
+        rng, labels_onehot, labelrate_train, labelrate_val
+    )
+
+    # Normalize adjacency and build DGL graph
+    adj_norm = normalize_adj(adj)  # COO
+    adj_sp = adj_norm.tocoo()
+    g = dgl.graph((adj_sp.row.astype(np.int64), adj_sp.col.astype(np.int64)), num_nodes=adj_sp.shape[0])
+
+    # Features -> torch.FloatTensor
+    if sp.issparse(features):
+        features = features.todense()
+    features = np.array(features)
+    g.ndata["feat"] = torch.FloatTensor(features)
+
+    # Labels as integer LongTensor
+    labels_tensor = torch.LongTensor(np.array(labels_arr).astype(np.int64).reshape(-1))
+
+    # Index tensors
+    idx_train = torch.LongTensor(idx_train_list)
+    idx_val = torch.LongTensor(idx_val_list)
+    idx_test = torch.LongTensor(idx_test_list)
+
+    return g, labels_tensor, idx_train, idx_val, idx_test
 
 def rand_train_test_idx(label, train_prop=.5, valid_prop=.25, ignore_negative=True):
     """ randomly splits label into train/valid/test splits """

@@ -24,7 +24,7 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def get_training_config(config_path, model_name, dataset):
+def get_training_config(config_path, model_name, dataset, teacher_model=None, teacher_hidden_dim=False):
     with open(config_path, "r") as conf:
         full_config = yaml.load(conf, Loader=yaml.FullLoader)
     dataset_specific_config = full_config["global"]
@@ -36,6 +36,11 @@ def get_training_config(config_path, model_name, dataset):
         specific_config = dataset_specific_config
 
     specific_config["model_name"] = model_name
+    if teacher_hidden_dim and teacher_model:
+        try:
+            specific_config["teacher_hidden_dim"] = full_config[dataset][teacher_model]["hidden_dim"]
+        except:
+            specific_config["teacher_hidden_dim"] = full_config["global"]["hidden_dim"]
     return specific_config
 
 

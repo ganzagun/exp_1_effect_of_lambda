@@ -35,7 +35,7 @@ def load_data(dataset, dataset_path, **kwargs):
         )
     elif dataset in OGB_data:
         return load_ogb_data(dataset, dataset_path)
-    elif dataset = 'actor':
+    elif dataset == 'actor':
         return load_actor_data(
             dataset, 
             dataset_path,
@@ -43,7 +43,7 @@ def load_data(dataset, dataset_path, **kwargs):
             kwargs["labelrate_train"],
             kwargs["labelrate_val"]
         )
-    elif dataset = 'fraud':
+    elif dataset == 'fraud':
         return load_fraudamazon_data(
             dataset, 
             dataset_path,

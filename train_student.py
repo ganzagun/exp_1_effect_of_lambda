@@ -5,7 +5,7 @@ import torch
 import torch.optim as optim
 from pathlib import Path
 from models import Model
-from dataloader import load_data, load_out_t, load_out_emb_t
+from dataloader import load_data, load_logits_t, load_out_t, load_out_emb_t
 from utils import (
     get_logger,
     get_evaluator,
@@ -20,6 +20,9 @@ from train_and_eval import distill_run_transductive, distill_run_inductive
 import networkx as nx
 from position_encoding import DeepWalk
 import dgl
+import matplotlib.pyplot as plt
+import pandas as pd
+import os
 
 
 def get_args():
@@ -56,6 +59,11 @@ def get_args():
         "--save_results",
         action="store_true",
         help="Set to True to save the loss curves, trained model, and min-cut loss for the transductive setting",
+    )
+    parser.add_argument(
+        "--teacher_logits",
+        default=None,
+        type=int
     )
 
     """Dataset"""
@@ -101,6 +109,9 @@ def get_args():
     # parser.add_argument("--dropout_ratio", type=float, default=0)
     parser.add_argument(
         "--norm_type", type=str, default="none", help="One of [none, batch, layer]"
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=1.0, help="Temperature of teacher logits for student training"
     )
 
     """SAGE Specific"""
@@ -194,6 +205,27 @@ def get_args():
         type=float,
         default=-1,
         help="feat_distill_weight for parameter sensitivity",
+    )
+    parser.add_argument(
+        "--teacher_emb_layers",
+        nargs="*",
+        default=[-1],
+        type=int,
+        help="Layers for which teacher embeddings are saved (0 indexed)"
+    )
+    parser.add_argument(
+        "--student_emb_layers",
+        nargs="*",
+        default=[-1],
+        type=int,
+        help="Layers for which student embeddings are to be distilled (0 indexed; must be of same size as teacher_emb_layers)"
+    )
+    parser.add_argument(
+        "--feat_distill_weights",
+        nargs="*",
+        default=[-1],
+        type=float,
+        help="feat_distill_weights for distillation of corresponding teacher and student layer representations (must be of same size as teacher_emb_layers)"
     )
 
     args = parser.parse_args()
@@ -330,10 +362,13 @@ def run(args):
     if args.model_config_path is not None:
         conf = get_training_config(
             # args.model_config_path, args.student, args.dataset
-            args.exp_setting + args.model_config_path, args.student, args.dataset
+            args.exp_setting + args.model_config_path, args.student, args.dataset, args.teacher, True
         )  # Note: student config
     conf = dict(args.__dict__, **conf)
     conf["device"] = device
+    conf["num_distill_layers"] = len(args.student_emb_layers)
+    conf["num_layers"] = args.num_layers
+    conf["fan_out"] = args.fan_out
     logger.info(f"conf: {conf}")
     # print('conf: ', conf)
 
@@ -432,7 +467,7 @@ def run(args):
 
                 # change the order of position_feature_obs
                 idx_position_feature = idx_obs.tolist()
-                position_feature_list_correct_order = [[] for i in range(len(g.adj()))]
+                position_feature_list_correct_order = [[] for i in range(g.num_nodes())]
                 for idx_from_zero, idx_p_f in enumerate(idx_position_feature):
                     temp_position_feature = position_feature_obs[idx_from_zero]
                     position_feature_list_correct_order[idx_p_f].extend(temp_position_feature)
@@ -488,7 +523,7 @@ def run(args):
 
                 # change the order of position_feature_obs
                 idx_position_feature = idx_obs.tolist()
-                position_feature_list_correct_order = [[] for i in range(len(g.adj()))]
+                position_feature_list_correct_order = [[] for i in range(g.num_nodes())]
                 for idx_from_zero, idx_p_f in enumerate(idx_position_feature):  # tqdm(
                     temp_position_feature = position_feature_obs[idx_from_zero]
                     position_feature_list_correct_order[idx_p_f].extend(temp_position_feature)
@@ -570,9 +605,13 @@ def run(args):
     evaluator = get_evaluator(conf["dataset"])
 
     """Load teacher model output"""
+    logits_t = load_logits_t(out_t_dir)
+    logits_temp_t = logits_t/args.temperature
     out_t = load_out_t(out_t_dir)
-    out_emb_t = load_out_emb_t(out_t_dir)
-    out_emb_t = out_emb_t.to(device)
+    out_emb_t = []
+    if args.teacher_emb_layers != [-1]:
+        for layer_num in args.teacher_emb_layers:
+            out_emb_t.append(load_out_emb_t(out_t_dir, layer_num).to(device))
     logger.info(
         f"teacher score on train data: {evaluator(out_t[idx_train], labels[idx_train])}"
     )
@@ -586,12 +625,12 @@ def run(args):
     """Data split and run"""
     loss_and_score = []
     if args.exp_setting == "tran":
-        out, score_val, score_test = distill_run_transductive(
+        out, score_test, ece_test, ace_test, brier_test = distill_run_transductive(
             conf,
             model,
             feats,
             labels,
-            out_t,
+            logits_temp_t,
             out_emb_t,
             distill_indices,
             criterion_l,
@@ -603,15 +642,15 @@ def run(args):
             g,
             args
         )
-        score_lst = [score_test]
+
 
     elif args.exp_setting == "ind":
-        out, score_val, score_test_tran, score_test_ind = distill_run_inductive(
+        out, score_test, ece_test, ace_test, brier_test = distill_run_inductive(
             conf,
             model,
             feats,
             labels,
-            out_t,
+            logits_temp_t,
             out_emb_t,
             distill_indices,
             criterion_l,
@@ -620,9 +659,10 @@ def run(args):
             optimizer,
             logger,
             loss_and_score,
+            g,
             args
         )
-        score_lst = [score_test_tran, score_test_ind]
+
 
     logger.info(
         f"num_layers: {conf['num_layers']}. hidden_dim: {conf['hidden_dim']}. dropout_ratio: {conf['dropout_ratio']}"
@@ -649,11 +689,14 @@ def run(args):
         #     f.write(f"{min_cut :.4f}\n")
         print('min_cut: ', min_cut, flush=True)
 
-    return score_lst
+    return score_test, ece_test, ace_test, brier_test
 
 
 def repeat_run(args):
     scores = []
+    eces = []
+    aces = []
+    briers = []
     for seed in range(args.num_exp):
         if seed == 0:
             cal_dw_flag = True
@@ -661,36 +704,86 @@ def repeat_run(args):
             cal_dw_flag = False
         args.cal_dw_flag = cal_dw_flag
         args.seed = seed
-        scores.append(run(args))
+        temp_score, temp_ece, temp_ace, temp_brier  = run(args)
+        scores.append(temp_score)
+        eces.append(temp_ece)
+        aces.append(temp_ace)
+        briers.append(temp_brier)
 
     scores_np = np.array(scores)
-    return scores_np.mean(axis=0), scores_np.std(axis=0)
-
-
+    eces_np = np.array(eces)
+    aces_np = np.array(aces)
+    briers_np = np.array(briers)
+    return (
+        scores_np.mean(axis=0),
+        scores_np.std(axis=0),
+        eces_np.mean(axis=0),
+        eces_np.std(axis=0),
+        aces_np.mean(axis=0),
+        aces_np.std(axis=0),
+        briers_np.mean(axis=0),
+        briers_np.std(axis=0)
+    )
+    
 def main():
     args = get_args()
-    if args.num_exp == 1:
-        args.cal_dw_flag = True
-        score = run(args)
-        score_str = "".join([f"{s : .4f}\t" for s in score])
-        if args.exp_setting == 'ind':
-            score_prod = score[0] * 0.8 + score[1] * 0.2
+    assert args.num_exp > 1
 
-    elif args.num_exp > 1:
-        score_mean, score_std = repeat_run(args)
-        score_str = "".join(
-            [f"{s : .4f}\t" for s in score_mean] + [f"{s : .4f}\t" for s in score_std]
-        )
-        if args.exp_setting == 'ind':
-            score_prod = score_mean[0] * 0.8 + score_mean[1] * 0.2
+    (
+        score_mean,
+        score_std,
+        ece_mean,
+        ece_std,
+        ace_mean,
+        ace_std,
+        brier_mean,
+        brier_std,
+    ) = repeat_run(args)
+
+    score_str = "".join(
+        [f"{score_mean : .4f}\t"] + [f"{score_std : .4f}\t"]
+    )
+    if args.exp_setting == "tran":
+        print("Score Mean and Std: ", score_mean, ", ", score_std)
+        print("ECE Mean and Std: ", ece_mean, ", ", ece_std)
+        print("ACE Mean and Std: ", ace_mean, ", ", ace_std)
+        print("Brier Mean and Std: ", brier_mean, ", ", brier_std)
+
+        data = [[args.teacher_logits, args.temperature, score_mean, ece_mean, ace_mean, brier_mean]]
+        filename = args.output_dir.parent.joinpath("output.csv")
+        new_row = pd.DataFrame(data, columns=["Teacher Logits", "Temperature", "Score", "ECE", "ACE", "Brier"])
+        
+        if os.path.isfile(filename):
+            new_row.to_csv(filename, mode="a", header=False, index=False)
+        else:
+            new_row.to_csv(filename, mode="w", header=True, index=False)
+            
+    if args.exp_setting == 'ind':
+        print("Score Mean and Std (test_ind): ", score_mean, ", ", score_std)
+        print("ECE Mean and Std (test_ind): ", ece_mean, ", ", ece_std)
+        print("ACE Mean and Std (test_ind): ", ace_mean, ", ", ace_std)
+        print("Brier Mean and Std (test_ind): ", brier_mean, ", ", brier_std)
+                
+        # score_prod = score_mean[0] * 0.8 + score_mean[1] * 0.2
+        # ece_prod = ece_mean[0] * 0.8 + ece_mean[1] * 0.2
+        # ace_prod = ace_mean[0] * 0.8 + ace_mean[1] * 0.2
+        # brier_prod = brier_mean[0] * 0.8 + brier_mean[1] * 0.2
+        # print("Score Prod Mean: ", score_prod)
+        # print("ECE Prod Mean: ", ece_prod)
+        # print("ACE Prod Mean: ", ace_prod)
+        # print("Brier Prod Mean: ", brier_prod)
+
+        data = [[args.teacher_logits, args.temperature, score_mean, ece_mean, ace_mean, brier_mean]]
+        filename = args.output_dir.parent.joinpath("output.csv")
+        new_row = pd.DataFrame(data, columns=["Teacher Logits", "Temperature", "Score (test_ind)", "ECE (test_ind)", "ACE (test_ind)", "Brier (test_ind)"])
+        
+        if os.path.isfile(filename):
+            new_row.to_csv(filename, mode="a", header=False, index=False)
+        else:
+            new_row.to_csv(filename, mode="w", header=True, index=False)
 
     with open(args.output_dir.parent.joinpath("exp_results"), "a+") as f:
         f.write(f"{score_str}\n")
-
-    # for collecting aggregated results
-    print(score_str, flush=True)
-    if args.exp_setting == 'ind':
-        print('prod: ', score_prod)
 
 
 if __name__ == "__main__":

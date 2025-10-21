@@ -15,6 +15,8 @@ from utils import (
     graph_split,
 )
 from train_and_eval import run_transductive, run_inductive
+import matplotlib.pyplot as plt
+import pandas as pd
 
 
 def get_args():
@@ -94,6 +96,9 @@ def get_args():
     parser.add_argument(
         "--norm_type", type=str, default="none", help="One of [none, batch, layer]"
     )
+    parser.add_argument(
+        "--temperatures", type=float, nargs="+", default=[1.0], help="Temperatures of teacher logits for student training"
+    )
 
     """SAGE Specific"""
     parser.add_argument("--batch_size", type=int, default=512)
@@ -105,6 +110,11 @@ def get_args():
     )
     parser.add_argument(
         "--num_workers", type=int, default=0, help="Number of workers for sampler"
+    )
+
+    """Layer Distillation"""
+    parser.add_argument(
+        "--teacher_emb_layers", type=int, nargs="*", default=[-1], help="Layers for which teacher embeddings are to be saved (0 indexed)"
     )
 
     """Optimization"""
@@ -217,6 +227,10 @@ def run(args):
         conf = get_training_config(args.exp_setting + args.model_config_path, args.teacher, args.dataset)
     conf = dict(args.__dict__, **conf)
     conf["device"] = device
+    conf["num_layers"] = args.num_layers
+    conf["teacher_hidden_dim"] = None
+    conf["num_distill_layers"] = None
+    conf["fan_out"] = args.fan_out
     logger.info(f"conf: {conf}")
 
     """ Model init """
@@ -231,8 +245,7 @@ def run(args):
     loss_and_score = []
     if args.exp_setting == "tran":
         indices = (idx_train, idx_val, idx_test)
-
-        out, score_val, score_test, emb_list = run_transductive(
+        out, score_test, emb_list, ece_test, ace_test, brier_test, logits = run_transductive(
             conf,
             model,
             g,
@@ -244,13 +257,13 @@ def run(args):
             optimizer,
             logger,
             loss_and_score,
+            args
         )
-        score_lst = [score_test]
 
     elif args.exp_setting == "ind":
         indices = graph_split(idx_train, idx_val, idx_test, args.split_rate, args.seed)
 
-        out, score_val, score_test_tran, score_test_ind, emb_list = run_inductive(
+        out, score_test, emb_list, ece_test, ace_test, brier_test, logits = run_inductive(
             conf,
             model,
             g,
@@ -262,8 +275,8 @@ def run(args):
             optimizer,
             logger,
             loss_and_score,
+            args
         )
-        score_lst = [score_test_tran, score_test_ind]
 
     logger.info(
         f"num_layers: {conf['num_layers']}. hidden_dim: {conf['hidden_dim']}. dropout_ratio: {conf['dropout_ratio']}"
@@ -273,10 +286,13 @@ def run(args):
     """ Saving teacher outputs """
     if not args.compute_min_cut:
         if 'MLP' not in model.model_name:
+            logits_np = logits.detach().cpu().numpy()
+            np.savez(output_dir.joinpath("logits"), logits_np)
             out_np = out.detach().cpu().numpy()
             np.savez(output_dir.joinpath("out"), out_np)
-            out_emb_list = emb_list[-1].detach().cpu().numpy()  # last hidden layer
-            np.savez(output_dir.joinpath("out_emb_list"), out_emb_list)
+            for layer_num in args.teacher_emb_layers:
+                out_emb_list = emb_list[layer_num].detach().cpu().numpy()
+                np.savez(output_dir.joinpath("out_emb_list" + str(layer_num)), out_emb_list)
 
         """ Saving loss curve and model """
         if args.save_results:
@@ -293,37 +309,89 @@ def run(args):
         # with open(output_dir.parent.joinpath("min_cut_loss"), "a+") as f:
         #     f.write(f"{min_cut :.4f}\n")
         print('min_cut: ', min_cut)
-
-    return score_lst
+    
+    return score_test, ece_test, ace_test, brier_test
 
 
 def repeat_run(args):
     scores = []
+    eces = []
+    aces = []
+    briers = []
     for seed in range(args.num_exp):
         args.seed = seed
-        temp_score = run(args)
+        temp_score, temp_ece, temp_ace, temp_brier = run(args)
         scores.append(temp_score)
+        eces.append(temp_ece)
+        aces.append(temp_ace)
+        briers.append(temp_brier)
     scores_np = np.array(scores)
-    return scores_np.mean(axis=0), scores_np.std(axis=0)
-
+    eces_np = np.array(eces)
+    aces_np = np.array(aces)
+    briers_np = np.array(briers)
+    return (
+        scores_np.mean(axis=0),
+        scores_np.std(axis=0),
+        eces_np.mean(axis=0),
+        eces_np.std(axis=0),
+        aces_np.mean(axis=0),
+        aces_np.std(axis=0),
+        briers_np.mean(axis=0),
+        briers_np.std(axis=0)
+    )
 
 def main():
     args = get_args()
-    if args.num_exp == 1:
-        score = run(args)
-        score_str = "".join([f"{s : .4f}\t" for s in score])
+    assert args.num_exp > 1
 
-    elif args.num_exp > 1:
-        score_mean, score_std = repeat_run(args)
-        score_str = "".join(
-            [f"{s : .4f}\t" for s in score_mean] + [f"{s : .4f}\t" for s in score_std]
-        )
+    (
+        score_mean,
+        score_std,
+        ece_mean,
+        ece_std,
+        ace_mean,
+        ace_std,
+        brier_mean,
+        brier_std
+    ) = repeat_run(args)
+
+    score_str = "".join(
+        [f"{score_mean : .4f}\t"] + [f"{score_std : .4f}\t"]
+    )
+    if args.exp_setting == "tran":
+        assert len(ece_mean) == len(args.temperatures)
+        print("Score Mean and Std: ", score_mean, ", ", score_std)
+        print("ECE Mean and Std: ", ece_mean, ", ", ece_std)
+        print("ACE Mean and Std: ", ace_mean, ", ", ace_std)
+        print("Brier Mean and Std: ", brier_mean, ", ", brier_std)
+
+        data = []
+        for i, temperature in enumerate(args.temperatures):
+            data.append(
+                [i+1, temperature, score_mean, ece_mean[i], ace_mean[i], brier_mean[i]]
+            )
+        
+        df = pd.DataFrame(data, columns=["Teacher Logits", "Temperature", "Score", "ECE", "ACE", "Brier"])
+        df.to_csv(args.output_dir.parent.joinpath("output.csv"), index=False)
+    elif args.exp_setting == "ind":
+        assert len(ece_mean) == len(args.temperatures)
+        print("Score Mean and Std (test_ind): ", score_mean, ", ", score_std)
+        print("ECE Mean and Std (test_ind): ", ece_mean, ", ", ece_std)
+        print("ACE Mean and Std (test_ind): ", ace_mean, ", ", ace_std)
+        print("Brier Mean and Std (test_ind): ", brier_mean, ", ", brier_std)
+        
+
+        data = []
+        for i, temperature in enumerate(args.temperatures):
+            data.append(
+                [i+1, temperature, score_mean, ece_mean[i], ace_mean[i], brier_mean[i]]
+            )
+        
+        df = pd.DataFrame(data, columns=["Teacher Logits", "Temperature", "Score(test_ind)", "ECE (test_ind)", "ACE (test_ind)", "Brier (test_ind)"])
+        df.to_csv(args.output_dir.parent.joinpath("output.csv"), index=False)
 
     with open(args.output_dir.parent.joinpath("exp_results"), "a+") as f:
         f.write(f"{score_str}\n")
-
-    # for collecting aggregated results
-    print(score_str)
 
 
 if __name__ == "__main__":

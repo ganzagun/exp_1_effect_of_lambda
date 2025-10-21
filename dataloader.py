@@ -53,9 +53,6 @@ def load_data(dataset, dataset_path, **kwargs):
         )
     else
         raise ValueError(f"Unknown dataset: {dataset}")
-
-
-def load_actor(dataset, dataset_path):
     
 def load_graph(graph_path):
     """

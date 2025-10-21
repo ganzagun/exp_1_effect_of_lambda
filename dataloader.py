@@ -43,6 +43,14 @@ def load_data(dataset, dataset_path, **kwargs):
             kwargs["labelrate_train"],
             kwargs["labelrate_val"]
         )
+    elif dataset = 'fraud':
+        return load_fraudamazon_data(
+            dataset, 
+            dataset_path,
+            kwargs["seed"],
+            kwargs["labelrate_train"],
+            kwargs["labelrate_val"]
+        )
     else
         raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -137,7 +145,7 @@ def load_cpf_data(dataset, dataset_path, seed, labelrate_train, labelrate_val):
     return g, labels, idx_train, idx_val, idx_test
 
 
-def load_actor_data(dataset, dataset_path, seed, labelrate_train, labelrate_val) 
+def load_actor_data(dataset, dataset_path, seed, labelrate_train, labelrate_val):
     """
     Load Actor dataset (prefers {dataset}.npz in dataset_path, else loads DGL ActorDataset).
     Returns:
@@ -206,7 +214,7 @@ def load_actor_data(dataset, dataset_path, seed, labelrate_train, labelrate_val)
     return g, labels_tensor, idx_train, idx_val, idx_test
 
 
-def load_fraudamazon_data(dataset: str, dataset_path: str, seed: int, labelrate_train, labelrate_val):
+def load_fraudamazon_data(dataset, dataset_path, seed, labelrate_train, labelrate_val):
     """
     Load FraudAmazon graph dataset.
 

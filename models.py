@@ -17,6 +17,8 @@ class MLP(nn.Module):
             graph=None,
             byte_idx_train=None,
             labels_one_hot=None,
+            teacher_hidden_dim=None,
+            num_distill_layers=None
     ):
         super(MLP, self).__init__()
         self.num_layers = num_layers
@@ -43,9 +45,10 @@ class MLP(nn.Module):
                     self.norms.append(nn.LayerNorm(hidden_dim))
 
             self.layers.append(nn.Linear(hidden_dim, output_dim))
-            self.teacher_feature_encoder = nn.Linear(hidden_dim, hidden_dim)
-            self.mlp_feature_encoder = nn.Linear(hidden_dim, hidden_dim)
-            self.mlp_feature_encoder_2 = nn.Linear(hidden_dim, hidden_dim)
+            self.mlp_feature_encoders = []
+            if teacher_hidden_dim and num_distill_layers:
+                for layer in range(num_distill_layers):
+                    self.mlp_feature_encoders.append(nn.Linear(hidden_dim, teacher_hidden_dim))
 
     def forward(self, feats):
         h = feats
@@ -61,11 +64,11 @@ class MLP(nn.Module):
 
         return h_list, h
 
-    def encode_teacher4kd(self, teacher_feat):
-        return self.dropout(F.relu(self.teacher_feature_encoder(teacher_feat)))
-
-    def encode_mlp4kd(self, mlp_feat):
-        return self.dropout(F.relu(self.mlp_feature_encoder(mlp_feat)))
+    def encode_model4kd(self, mlp_feat):
+        mlp_feature_encoders = []
+        for encoder in self.mlp_feature_encoders:
+            mlp_feature_encoders.append(self.dropout(F.relu(encoder(mlp_feat))))
+        return mlp_feature_encoders
 
 
 """
@@ -84,6 +87,8 @@ class SAGE(nn.Module):
             dropout_ratio,
             activation,
             norm_type="none",
+            teacher_hidden_dim=None,
+            num_distill_layers=None
     ):
         super().__init__()
         self.num_layers = num_layers
@@ -112,6 +117,10 @@ class SAGE(nn.Module):
                     self.norms.append(nn.LayerNorm(hidden_dim))
 
             self.layers.append(SAGEConv(hidden_dim, output_dim, "gcn"))
+            self.sage_feature_encoders = []
+            if teacher_hidden_dim and num_distill_layers:
+                for layer in range(num_distill_layers):
+                    self.sage_feature_encoders.append(nn.Linear(hidden_dim, teacher_hidden_dim))
 
     def forward(self, blocks, feats):
         h = feats
@@ -166,6 +175,12 @@ class SAGE(nn.Module):
                 emb_list.append(hidden_emb)
         # return y
         return y, emb_list
+    
+    def encode_model4kd(self, sage_feat):
+        sage_feature_encoders = []
+        for encoder in self.sage_feature_encoders:
+            sage_feature_encoders.append(self.dropout(F.relu(encoder(sage_feat))))
+        return sage_feature_encoders
 
 
 class GCN(nn.Module):
@@ -178,6 +193,8 @@ class GCN(nn.Module):
             dropout_ratio,
             activation,
             norm_type="none",
+            teacher_hidden_dim=None,
+            num_distill_layers=None
     ):
         super().__init__()
         self.num_layers = num_layers
@@ -205,6 +222,10 @@ class GCN(nn.Module):
                     self.norms.append(nn.LayerNorm(hidden_dim))
 
             self.layers.append(GraphConv(hidden_dim, output_dim))
+            self.gcn_feature_encoders = []
+            if teacher_hidden_dim and num_distill_layers:
+                for layer in range(num_distill_layers):
+                    self.gcn_feature_encoders.append(nn.Linear(hidden_dim, teacher_hidden_dim))
 
     def forward(self, g, feats):
         h = feats
@@ -217,6 +238,12 @@ class GCN(nn.Module):
                     h = self.norms[l](h)
                 h = self.dropout(h)
         return h_list, h
+    
+    def encode_model4kd(self, gcn_feat):
+        gcn_feature_encoders = []
+        for encoder in self.gcn_feature_encoders:
+            gcn_feature_encoders.append(self.dropout(F.relu(encoder(gcn_feat))))
+        return gcn_feature_encoders
 
 
 class GAT(nn.Module):
@@ -232,6 +259,8 @@ class GAT(nn.Module):
             attn_drop=0.3,
             negative_slope=0.2,
             residual=False,
+            teacher_hidden_dim=None,
+            num_distill_layers=None
     ):
         super(GAT, self).__init__()
         # For GAT, the number of layers is required to be > 1
@@ -241,6 +270,7 @@ class GAT(nn.Module):
         self.num_layers = num_layers
         self.layers = nn.ModuleList()
         self.activation = activation
+        self.dropout = nn.Dropout(dropout_ratio)
 
         heads = ([num_heads] * num_layers) + [1]
         # input (no residual)
@@ -285,6 +315,11 @@ class GAT(nn.Module):
             )
         )
 
+        self.gat_feature_encoders = []
+        if teacher_hidden_dim and num_distill_layers:
+            for layer in range(num_distill_layers):
+                self.gat_feature_encoders.append(nn.Linear(hidden_dim*num_heads, teacher_hidden_dim))
+
     def forward(self, g, feats):
         h = feats
         h_list = []
@@ -297,6 +332,12 @@ class GAT(nn.Module):
             else:
                 h = h.mean(1)
         return h_list, h
+    
+    def encode_model4kd(self, gat_feat):
+        gat_feature_encoders = []
+        for encoder in self.gat_feature_encoders:
+            gat_feature_encoders.append(self.dropout(F.relu(encoder(gat_feat))))
+        return gat_feature_encoders
 
 
 class APPNP(nn.Module):
@@ -312,6 +353,8 @@ class APPNP(nn.Module):
             edge_drop=0.5,
             alpha=0.1,
             k=10,
+            teacher_hidden_dim=None,
+            num_distill_layers=None
     ):
 
         super(APPNP, self).__init__()
@@ -339,6 +382,10 @@ class APPNP(nn.Module):
                     self.norms.append(nn.LayerNorm(hidden_dim))
 
             self.layers.append(nn.Linear(hidden_dim, output_dim))
+            self.appnp_feature_encoders = []
+            if teacher_hidden_dim and num_distill_layers:
+                for layer in range(num_distill_layers):
+                    self.appnp_feature_encoders.append(nn.Linear(hidden_dim, teacher_hidden_dim))
 
         self.propagate = APPNPConv(k, alpha, edge_drop)
         self.reset_parameters()
@@ -362,6 +409,12 @@ class APPNP(nn.Module):
 
         h = self.propagate(g, h)
         return h_list, h
+    
+    def encode_model4kd(self, appnp_feat):
+        appnp_feature_encoders = []
+        for encoder in self.appnp_feature_encoders:
+            appnp_feature_encoders.append(self.dropout(F.relu(encoder(appnp_feat))))
+        return appnp_feature_encoders
 
 
 class Model(nn.Module):
@@ -385,6 +438,8 @@ class Model(nn.Module):
                 graph=graph,
                 byte_idx_train=byte_idx_train,
                 labels_one_hot=labels_one_hot,
+                teacher_hidden_dim=conf["teacher_hidden_dim"],
+                num_distill_layers=conf["num_distill_layers"]
             ).to(conf["device"])
 
         elif "SAGE" in conf["model_name"]:
@@ -396,6 +451,8 @@ class Model(nn.Module):
                 dropout_ratio=conf["dropout_ratio"],
                 activation=F.relu,
                 norm_type=conf["norm_type"],
+                teacher_hidden_dim=conf["teacher_hidden_dim"],
+                num_distill_layers=conf["num_distill_layers"]
             ).to(conf["device"])
         elif "GCN" in conf["model_name"]:
             self.encoder = GCN(
@@ -406,6 +463,8 @@ class Model(nn.Module):
                 dropout_ratio=conf["dropout_ratio"],
                 activation=F.relu,
                 norm_type=conf["norm_type"],
+                teacher_hidden_dim=conf["teacher_hidden_dim"],
+                num_distill_layers=conf["num_distill_layers"]
             ).to(conf["device"])
         elif "GAT" in conf["model_name"]:
             self.encoder = GAT(
@@ -416,6 +475,8 @@ class Model(nn.Module):
                 dropout_ratio=conf["dropout_ratio"],
                 activation=F.relu,
                 attn_drop=conf["attn_dropout_ratio"],
+                teacher_hidden_dim=conf["teacher_hidden_dim"],
+                num_distill_layers=conf["num_distill_layers"]
             ).to(conf["device"])
         elif "APPNP" in conf["model_name"]:
             self.encoder = APPNP(
@@ -426,9 +487,11 @@ class Model(nn.Module):
                 dropout_ratio=conf["dropout_ratio"],
                 activation=F.relu,
                 norm_type=conf["norm_type"],
+                teacher_hidden_dim=conf["teacher_hidden_dim"],
+                num_distill_layers=conf["num_distill_layers"]
             ).to(conf["device"])
 
-    def forward(self, data, feats):
+    def forward(self, data, feats, return_sage_emb=False):
         """
         data: a graph `g` or a `dataloader` of blocks
         """
@@ -437,7 +500,10 @@ class Model(nn.Module):
         elif "GCN" in self.model_name or "GAT" in self.model_name or "APPNP" in self.model_name:
             return self.encoder(data, feats)
         else:
-            return self.encoder(data, feats)[1]
+            if return_sage_emb:
+                return self.encoder(data, feats)
+            else:
+                return self.encoder(data, feats)[1]
 
     def forward_fitnet(self, data, feats):
         """
@@ -456,8 +522,5 @@ class Model(nn.Module):
         else:
             return self.forward(data, feats)
 
-    def encode_teacher4kd(self, teacher_feat):
-        return self.encoder.encode_teacher4kd(teacher_feat)
-
-    def encode_mlp4kd(self, mlp_feat):
-        return self.encoder.encode_mlp4kd(mlp_feat)
+    def encode_model4kd(self, feat):
+        return self.encoder.encode_model4kd(feat)

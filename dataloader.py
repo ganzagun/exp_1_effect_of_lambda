@@ -152,12 +152,16 @@ def rand_train_test_idx(label, train_prop=.5, valid_prop=.25, ignore_negative=Tr
     return train_idx, valid_idx, test_idx
 
 
+def load_logits_t(out_t_dir):
+    return torch.from_numpy(np.load(out_t_dir.joinpath("logits.npz"))["arr_0"])
+
+
 def load_out_t(out_t_dir):
     return torch.from_numpy(np.load(out_t_dir.joinpath("out.npz"))["arr_0"])
 
 
-def load_out_emb_t(out_t_dir):
-    return torch.from_numpy(np.load(out_t_dir.joinpath("out_emb_list.npz"))["arr_0"])
+def load_out_emb_t(out_t_dir, layer_num):
+    return torch.from_numpy(np.load(out_t_dir.joinpath("out_emb_list" + str(layer_num) + ".npz"))["arr_0"])
 
 
 class NCDataset(object):

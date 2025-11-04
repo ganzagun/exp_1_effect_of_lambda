@@ -1,5 +1,25 @@
 from ..walker import RandomWalker
 from gensim.models import Word2Vec, KeyedVectors
+from gensim.models.callbacks import CallbackAny2Vec
+from tqdm import tqdm
+
+
+class TqdmCallback(CallbackAny2Vec):
+    """Callback to show progress bar for Word2Vec training"""
+    def __init__(self, total_epochs):
+        self.epoch = 0
+        self.total_epochs = total_epochs
+        self.pbar = None
+    
+    def on_train_begin(self, model):
+        self.pbar = tqdm(total=self.total_epochs, desc="Training Word2Vec", leave=True)
+    
+    def on_epoch_end(self, model):
+        self.epoch += 1
+        self.pbar.update(1)
+    
+    def on_train_end(self, model):
+        self.pbar.close()
 
 
 class DeepWalk:
@@ -11,8 +31,10 @@ class DeepWalk:
 
         self.walker = RandomWalker(
             graph, p=1, q=1, )
+        print(f"\nInitializing DeepWalk with {len(graph.nodes())} nodes")
         self.sentences = self.walker.simulate_walks(
             num_walks=num_walks, walk_length=walk_length, workers=workers, verbose=0)
+        print(f"Generated {len(self.sentences)} random walks")
 
     def train(self, embed_size=128, window_size=5, workers=1, iter=3, **kwargs):
 
@@ -24,7 +46,12 @@ class DeepWalk:
         kwargs["workers"] = workers
         kwargs["window"] = window_size
         kwargs["epochs"] = iter
+        
+        # Add callback for progress tracking
+        if "callbacks" not in kwargs:
+            kwargs["callbacks"] = [TqdmCallback(iter)]
 
+        print(f"\nTraining DeepWalk embeddings (size={embed_size}, window={window_size}, epochs={iter})")
         model = Word2Vec(**kwargs)
 
         self.w2v_model = model

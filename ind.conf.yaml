@@ -1,3 +1,4 @@
+
 global:
   num_layers: 2
   hidden_dim: 128
@@ -96,6 +97,79 @@ pubmed:
     dw_emb_size: 16
     adv_eps: 0.001
     feat_distill_weight: 0.9
+
+  GAT:
+    dropout_ratio: 0.6
+    weight_decay: 0.01
+    num_heads: 8
+    attn_dropout_ratio: 0.3
+
+  APPNP:
+    dropout_ratio: 0.5
+    weight_decay: 0.01
+
+
+# ============================================================
+actor:
+  SAGE:
+    fan_out: 5,5
+    learning_rate: 0.01
+    dropout_ratio: 0
+    weight_decay: 0.0005
+  
+  GCN:
+    hidden_dim: 64
+    dropout_ratio: 0.8
+    weight_decay: 0.001
+  
+  MLP:
+    learning_rate: 0.01
+    weight_decay: 0.005
+    dropout_ratio: 0.6
+    dw_walk_length: 50
+    dw_num_walks: 1
+    dw_window_size: 3
+    dw_iter: 3
+    dw_emb_size: 64
+    adv_eps: 0.05
+    feat_distill_weight: 0.1
+
+  GAT:
+    dropout_ratio: 0.6
+    weight_decay: 0.01
+    num_heads: 8
+    attn_dropout_ratio: 0.3
+
+  APPNP:
+    dropout_ratio: 0.5
+    weight_decay: 0.01
+
+
+
+# ============================================================
+fraud:
+  SAGE:
+    fan_out: 5,5
+    learning_rate: 0.01
+    dropout_ratio: 0
+    weight_decay: 0.0005
+  
+  GCN:
+    hidden_dim: 64
+    dropout_ratio: 0.8
+    weight_decay: 0.001
+  
+  MLP:
+    learning_rate: 0.01
+    weight_decay: 0.005
+    dropout_ratio: 0.6
+    dw_walk_length: 50
+    dw_num_walks: 1
+    dw_window_size: 3
+    dw_iter: 3
+    dw_emb_size: 64
+    adv_eps: 0.05
+    feat_distill_weight: 0.1
 
   GAT:
     dropout_ratio: 0.6
@@ -209,6 +283,15 @@ ogbn-arxiv:
     weight_decay: 0
     norm_type: batch
     fan_out: 5,10,15
+  GCN:
+    hidden_dim: 64
+    dropout_ratio: 0.8
+    weight_decay: 0.001
+  GAT:
+    dropout_ratio: 0.6
+    weight_decay: 0.01
+    num_heads: 8
+    attn_dropout_ratio: 0.3
 
 
 # ============================================================
@@ -247,3 +330,4 @@ ogbn-products:
     norm_type: batch
     fan_out: 5,10
     batch_size: 4096
+

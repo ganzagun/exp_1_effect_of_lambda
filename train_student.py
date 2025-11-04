@@ -1,3 +1,4 @@
+
 import argparse
 
 import numpy as np
@@ -331,8 +332,8 @@ def get_features_dw(adj, device, is_transductive, args):
         adj = np.asarray(adj.cpu())
         G = nx.Graph(adj)
 
-    model_emb = DeepWalk(G, walk_length=args.dw_walk_length, num_walks=args.dw_num_walks, workers=4)
-    model_emb.train(window_size=args.dw_window_size, iter=args.dw_iter, embed_size=args.dw_emb_size, workers=4)
+    model_emb = DeepWalk(G, walk_length=args.dw_walk_length, num_walks=args.dw_num_walks)
+    model_emb.train(window_size=args.dw_window_size, iter=args.dw_iter, embed_size=args.dw_emb_size)
 
     emb = model_emb.get_embeddings()  # get embedding vectors
     embeddings = []
@@ -1017,3 +1018,4 @@ def main():
 if __name__ == "__main__":
     args = get_args()
     main()
+

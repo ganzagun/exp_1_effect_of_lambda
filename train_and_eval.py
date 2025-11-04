@@ -4,6 +4,8 @@ import torch
 import dgl
 from utils import set_seed
 import torch.nn.functional as F
+from tqdm import tqdm
+import sys
 
 """
 1. Train and eval
@@ -41,10 +43,22 @@ def train_sage(model, dataloader, feats, labels, criterion, optimizer, lamb=1):
     device = feats.device
     model.train()
     total_loss = 0
+    
+    # Enable CUDA optimizations if available
+    use_cuda = device != "cpu" and torch.cuda.is_available()
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True  # Auto-tune for best performance
+    
     for step, (input_nodes, output_nodes, blocks) in enumerate(dataloader):
-        blocks = [blk.int().to(device) for blk in blocks]
+        # If graph is on GPU, blocks are already on GPU (GPU-based sampling)
+        # Otherwise, transfer blocks to GPU
+        if blocks[0].device.type == 'cpu' and use_cuda:
+            blocks = [blk.int().to(device, non_blocking=True) for blk in blocks]
+        
+        # Features and labels indexing (already on correct device)
         batch_feats = feats[input_nodes]
         batch_labels = labels[output_nodes]
+        
         # Compute loss and prediction
         logits = model(blocks, batch_feats)
         out = logits.log_softmax(dim=1)
@@ -52,7 +66,9 @@ def train_sage(model, dataloader, feats, labels, criterion, optimizer, lamb=1):
         total_loss += loss.item()
 
         loss *= lamb
-        optimizer.zero_grad()
+        
+        # Use set_to_none=True for better performance than zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
@@ -338,13 +354,13 @@ def compute_adaptive_ece(probs, labels, num_bins=15):
 
         ace += (avg_conf - avg_acc).abs() * len(bin_conf)
 
-    return ace / n
+    return (ace / n).item()
 
 def compute_brier_score(probs, labels, num_classes):
     num_classes = probs.size(1)
     true_one_hot = F.one_hot(labels, num_classes=num_classes).float()
     brier = (probs - true_one_hot).pow(2).sum(dim=1).mean() # MSE
-    return brier
+    return brier.item()
 
 def evaluate(model, data, feats, labels, num_classes, criterion, evaluator, idx_eval=None, temperatures=None, calculate_calibration=False, return_logits=False):
     """
@@ -521,6 +537,13 @@ def run_transductive(
     set_seed(conf["seed"])
     device = conf["device"]
     batch_size = conf["batch_size"]
+    
+    # Enable CPU affinity for better performance with DataLoader
+    if "SAGE" in model.model_name:
+        try:
+            dgl.dataloading.enable_cpu_affinity()
+        except:
+            pass  # Some systems may not support this
 
     idx_train, idx_val, idx_test = indices
 
@@ -532,13 +555,39 @@ def run_transductive(
 
     if "SAGE" in model.model_name:
         # Create dataloader for SAGE
-
-        # Create csr/coo/csc formats before launching sampling processes
-        # This avoids creating certain formats in each data loader process, which saves memory and CPU.
-        g.create_formats_()
+        
+        # OPTIMIZATION: For GPU, move graph to GPU for GPU-based sampling
+        # This keeps SAGE's sampling mechanism but eliminates CPU-GPU transfer bottleneck
+        if device != "cpu" and torch.cuda.is_available():
+            # Move entire graph to GPU for GPU-based sampling
+            g = g.to(device)
+            # Move indices to GPU as well for GPU-based sampling
+            idx_train = idx_train.to(device)
+            idx_val = idx_val.to(device)
+            idx_test = idx_test.to(device)
+            # For evaluation, we need indices that match the full graph size
+            all_nodes = torch.arange(g.num_nodes(), device=device)
+            # Create formats on GPU
+            g.create_formats_()
+            logger.info("Graph and indices moved to GPU for GPU-based neighbor sampling")
+        else:
+            # CPU-based sampling (original approach)
+            g.create_formats_()
+            all_nodes = torch.arange(g.num_nodes())
+            # Enable CPU affinity for CPU sampling
+            try:
+                dgl.dataloading.enable_cpu_affinity()
+            except:
+                pass
+        
         sampler = dgl.dataloading.MultiLayerNeighborSampler(
             [eval(fanout) for fanout in conf["fan_out"].split(",")]
         )
+        
+        # For GPU sampling, use num_workers=0 (sampling happens on GPU)
+        # For CPU sampling, can use multiple workers
+        num_workers_optimized = 0 if device != "cpu" else conf["num_workers"]
+        
         dataloader = dgl.dataloading.DataLoader(
             g,
             idx_train,
@@ -546,7 +595,7 @@ def run_transductive(
             batch_size=batch_size,
             shuffle=True,
             drop_last=False,
-            num_workers=conf["num_workers"],
+            num_workers=num_workers_optimized
         )
         
 
@@ -554,12 +603,12 @@ def run_transductive(
         sampler_eval = dgl.dataloading.MultiLayerFullNeighborSampler(1)
         dataloader_eval = dgl.dataloading.DataLoader(
             g,
-            torch.arange(g.num_nodes()),
+            all_nodes,
             sampler_eval,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
-            num_workers=conf["num_workers"],
+            num_workers=num_workers_optimized
         )
 
         data = dataloader
@@ -574,7 +623,8 @@ def run_transductive(
         data_eval = g
 
     best_epoch, best_score_val, count = 0, 0, 0
-    for epoch in range(1, conf["max_epoch"] + 1):
+    print("here")
+    for epoch in tqdm(range(1, conf["max_epoch"] + 1), desc='Training', leave=True, dynamic_ncols=True, file=sys.stderr):
         if "SAGE" in model.model_name:
             loss = train_sage(model, data, feats, labels, criterion, optimizer)
         elif "MLP" in model.model_name:
@@ -586,6 +636,7 @@ def run_transductive(
 
         if epoch % conf["eval_interval"] == 0:
             if "MLP" in model.model_name:
+               
                 _, loss_train, score_train = evaluate_mini_batch(
                     model, feats_train, labels_train, num_classes, criterion, batch_size, evaluator
                 )
@@ -682,6 +733,14 @@ def run_inductive(
     set_seed(conf["seed"])
     device = conf["device"]
     batch_size = conf["batch_size"]
+    
+    # Enable CPU affinity for better performance with DataLoader
+    if "SAGE" in model.model_name:
+        try:
+            dgl.dataloading.enable_cpu_affinity()
+        except:
+            pass  # Some systems may not support this
+    
     obs_idx_train, obs_idx_val, obs_idx_test, idx_obs, idx_test_ind = indices
 
     feats = feats.to(device)
@@ -695,14 +754,45 @@ def run_inductive(
 
     if "SAGE" in model.model_name:
         # Create dataloader for SAGE
-
-        # Create csr/coo/csc formats before launching sampling processes
-        # This avoids creating certain formats in each data loader process, which saves momory and CPU.
-        obs_g.create_formats_()
-        g.create_formats_()
+        
+        # OPTIMIZATION: For GPU, move graphs to GPU for GPU-based sampling
+        # This keeps SAGE's sampling mechanism but eliminates CPU-GPU transfer bottleneck
+        if device != "cpu" and torch.cuda.is_available():
+            # Move graphs to GPU for GPU-based sampling
+            obs_g = obs_g.to(device)
+            g = g.to(device)
+            # Move indices to GPU as well for GPU-based sampling
+            obs_idx_train = obs_idx_train.to(device)
+            obs_idx_val = obs_idx_val.to(device)
+            obs_idx_test = obs_idx_test.to(device)
+            idx_test_ind = idx_test_ind.to(device)
+            # For evaluation, we need indices that match the full graph size
+            obs_all_nodes = torch.arange(obs_g.num_nodes(), device=device)
+            all_nodes = torch.arange(g.num_nodes(), device=device)
+            # Create formats on GPU
+            obs_g.create_formats_()
+            g.create_formats_()
+            logger.info("Graphs and indices moved to GPU for GPU-based neighbor sampling")
+        else:
+            # CPU-based sampling (original approach)
+            obs_g.create_formats_()
+            g.create_formats_()
+            obs_all_nodes = torch.arange(obs_g.num_nodes())
+            all_nodes = torch.arange(g.num_nodes())
+            # Enable CPU affinity for CPU sampling
+            try:
+                dgl.dataloading.enable_cpu_affinity()
+            except:
+                pass
+        
         sampler = dgl.dataloading.MultiLayerNeighborSampler(
             [eval(fanout) for fanout in conf["fan_out"].split(",")]
         )
+        
+        # For GPU sampling, use num_workers=0 (sampling happens on GPU)
+        # For CPU sampling, can use multiple workers
+        num_workers_optimized = 0 if device != "cpu" else conf["num_workers"]
+        
         obs_dataloader = dgl.dataloading.DataLoader(
             obs_g,
             obs_idx_train,
@@ -710,27 +800,27 @@ def run_inductive(
             batch_size=batch_size,
             shuffle=True,
             drop_last=False,
-            num_workers=conf["num_workers"],
+            num_workers=num_workers_optimized
         )
 
         sampler_eval = dgl.dataloading.MultiLayerFullNeighborSampler(1)
         obs_dataloader_eval = dgl.dataloading.DataLoader(
             obs_g,
-            torch.arange(obs_g.num_nodes()),
+            obs_all_nodes,
             sampler_eval,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
-            num_workers=conf["num_workers"],
+            num_workers=num_workers_optimized
         )
         dataloader_eval = dgl.dataloading.DataLoader(
             g,
-            torch.arange(g.num_nodes()),
+            all_nodes,
             sampler_eval,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
-            num_workers=conf["num_workers"],
+            num_workers=num_workers_optimized
         )
 
         obs_data = obs_dataloader
@@ -754,7 +844,8 @@ def run_inductive(
         data_eval = g
 
     best_epoch, best_score_val, count = 0, 0, 0
-    for epoch in range(1, conf["max_epoch"] + 1):
+    print("\nStarting training...")
+    for epoch in tqdm(range(1, conf["max_epoch"] + 1), desc='Training epochs', leave=True, dynamic_ncols=True, file=sys.stdout):
         if "SAGE" in model.model_name:
             loss = train_sage(
                 model, obs_data, obs_feats, obs_labels, criterion, optimizer
@@ -775,6 +866,7 @@ def run_inductive(
             )
 
         if epoch % conf["eval_interval"] == 0:
+           
             if "MLP" in model.model_name:
                 _, loss_train, score_train = evaluate_mini_batch(
                     model, feats_train, labels_train, num_classes, criterion, batch_size, evaluator
@@ -946,10 +1038,25 @@ def distill_run_transductive(
     labels = labels.to(device)
 
     if "SAGE" in model.model_name:
-        graph.create_formats_()
+        # OPTIMIZATION: For GPU, move graph to GPU for GPU-based sampling
+        if device != "cpu" and torch.cuda.is_available():
+            graph = graph.to(device)
+            idx_l = idx_l.to(device)
+            idx_t = idx_t.to(device)
+            idx_val = idx_val.to(device)
+            idx_test = idx_test.to(device)
+            all_nodes = torch.arange(graph.num_nodes(), device=device)
+            graph.create_formats_()
+        else:
+            graph.create_formats_()
+            all_nodes = torch.arange(graph.num_nodes())
+        
         sampler = dgl.dataloading.MultiLayerNeighborSampler(
             [eval(fanout) for fanout in conf["fan_out"].split(",")]
         )
+        
+        num_workers_optimized = 0 if device != "cpu" else conf["num_workers"]
+        
         dataloader_l = dgl.dataloading.DataLoader(
             graph,
             idx_l,
@@ -957,7 +1064,7 @@ def distill_run_transductive(
             batch_size=batch_size,
             shuffle=True,
             drop_last=False,
-            num_workers=conf["num_workers"]
+            num_workers=num_workers_optimized
         )
 
         dataloader_t = dgl.dataloading.DataLoader(
@@ -967,18 +1074,18 @@ def distill_run_transductive(
             batch_size=batch_size,
             shuffle=True,
             drop_last=False,
-            num_workers=conf["num_workers"]
+            num_workers=num_workers_optimized
         )
 
         sampler_eval = dgl.dataloading.MultiLayerFullNeighborSampler(1)
         dataloader_eval = dgl.dataloading.DataLoader(
             graph,
-            torch.arange(graph.num_nodes()),
+            all_nodes,
             sampler_eval,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
-            num_workers=conf["num_workers"],
+            num_workers=num_workers_optimized,
         )
 
         data_t = dataloader_t
@@ -990,7 +1097,7 @@ def distill_run_transductive(
         feats_val, labels_val = feats[idx_val], labels[idx_val]
         feats_test, labels_test = feats[idx_test], labels[idx_test]
         out_t_soft = logits_temp_t.log_softmax(dim=1)
-    else:
+    else:  # GCN, GAT, APPNP models
         graph = graph.to(device)
         data = graph
         data_eval = graph
@@ -1002,7 +1109,8 @@ def distill_run_transductive(
     num_classes = args.label_dim
 
     best_epoch, best_score_val, count = 0, 0, 0
-    for epoch in range(1, conf["max_epoch"] + 1):
+    print("\nStarting distillation training...")
+    for epoch in tqdm(range(1, conf["max_epoch"] + 1), desc='Training epochs', leave=True, dynamic_ncols=True, file=sys.stderr):
         if "SAGE" in model.model_name:
             loss_l = train_both_distillation_batch_adv_sage(
                 model, data_l, feats, labels, out_emb_t_all, args, criterion_l, optimizer, 1 - lamb
@@ -1142,11 +1250,31 @@ def distill_run_inductive(
     obs_g = graph.subgraph(idx_obs)
 
     if "SAGE" in model.model_name:
-        obs_g.create_formats_()
-        graph.create_formats_()
+        # OPTIMIZATION: For GPU, move graphs to GPU for GPU-based sampling
+        if device != "cpu" and torch.cuda.is_available():
+            obs_g = obs_g.to(device)
+            graph = graph.to(device)
+            obs_idx_l = obs_idx_l.to(device)
+            obs_idx_t = obs_idx_t.to(device)
+            obs_idx_val = obs_idx_val.to(device)
+            obs_idx_test = obs_idx_test.to(device)
+            idx_test_ind = idx_test_ind.to(device)
+            obs_all_nodes = torch.arange(obs_g.num_nodes(), device=device)
+            all_nodes = torch.arange(graph.num_nodes(), device=device)
+            obs_g.create_formats_()
+            graph.create_formats_()
+        else:
+            obs_g.create_formats_()
+            graph.create_formats_()
+            obs_all_nodes = torch.arange(obs_g.num_nodes())
+            all_nodes = torch.arange(graph.num_nodes())
+        
         sampler = dgl.dataloading.MultiLayerNeighborSampler(
             [eval(fanout) for fanout in conf["fan_out"].split(",")]
         )
+        
+        num_workers_optimized = 0 if device != "cpu" else conf["num_workers"]
+        
         obs_dataloader_l = dgl.dataloading.DataLoader(
             obs_g,
             obs_idx_l,
@@ -1154,7 +1282,7 @@ def distill_run_inductive(
             batch_size=batch_size,
             shuffle=True,
             drop_last=False,
-            num_workers=conf["num_workers"],
+            num_workers=num_workers_optimized,
         )
         obs_dataloader_t = dgl.dataloading.DataLoader(
             obs_g,
@@ -1163,27 +1291,27 @@ def distill_run_inductive(
             batch_size=batch_size,
             shuffle=True,
             drop_last=False,
-            num_workers=conf["num_workers"]
+            num_workers=num_workers_optimized
         )
         
         sampler_eval = dgl.dataloading.MultiLayerFullNeighborSampler(1)
         obs_dataloader_eval = dgl.dataloading.DataLoader(
             obs_g,
-            torch.arange(obs_g.num_nodes()),
+            obs_all_nodes,
             sampler_eval,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
-            num_workers=conf["num_workers"]
+            num_workers=num_workers_optimized
         )
         dataloader_eval = dgl.dataloading.DataLoader(
             graph,
-            torch.arange(graph.num_nodes()),
+            all_nodes,
             sampler_eval,
             batch_size=batch_size,
             shuffle=False,
             drop_last=False,
-            num_workers=conf["num_workers"]
+            num_workers=num_workers_optimized
         )
 
         obs_data_t = obs_dataloader_t
@@ -1201,11 +1329,13 @@ def distill_run_inductive(
         feats_test_ind, labels_test_ind = feats[idx_test_ind], labels[idx_test_ind]
 
         out_t_soft = logits_temp_t.log_softmax(dim=1)
-    else:
+    else:  # GCN, GAT, APPNP models
         obs_g = obs_g.to(device)
         graph = graph.to(device)
 
         obs_data = obs_g
+        obs_data_l = obs_g  # Need to define this for the training function
+        obs_data_t = obs_g  # Need to define this for the training function
         obs_data_eval = obs_g
         data_eval = graph
     
@@ -1217,7 +1347,8 @@ def distill_run_inductive(
     num_classes = args.label_dim
     
     best_epoch, best_score_val, count = 0, 0, 0
-    for epoch in range(1, conf["max_epoch"] + 1):
+    print("\nStarting training...")
+    for epoch in tqdm(range(1, conf["max_epoch"] + 1), desc="Training epochs", leave=True, dynamic_ncols=True, file=sys.stderr):
         if "SAGE" in model.model_name:
             loss_l = train_both_distillation_batch_adv_sage(
                 model, obs_data_l, obs_feats, obs_labels, out_emb_t_all, args, criterion_l, optimizer, 1 - lamb

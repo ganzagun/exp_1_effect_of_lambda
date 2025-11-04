@@ -4,6 +4,9 @@ import numpy as np
 import torch
 import torch.optim as optim
 from pathlib import Path
+import csv
+import os
+import numpy as np
 from models import Model
 from dataloader import load_data, load_logits_t, load_out_t, load_out_emb_t
 from utils import (
@@ -16,13 +19,96 @@ from utils import (
     compute_min_cut_loss,
     graph_split,
 )
-from train_and_eval import distill_run_transductive, distill_run_inductive
+from train_and_eval import (
+    distill_run_transductive, 
+    distill_run_inductive,
+    compute_ece,
+    compute_adaptive_ece,
+    compute_brier_score
+)
 import networkx as nx
 from position_encoding import DeepWalk
 import dgl
 import matplotlib.pyplot as plt
 import pandas as pd
 import os
+
+
+def get_csv_path(dataset_name, base_dir="results"):
+    """Get the path for the CSV file based on dataset name."""
+    os.makedirs(base_dir, exist_ok=True)
+    return os.path.join(base_dir, f"{dataset_name}_results.csv")
+
+
+def create_or_append_to_csv(config, metrics, dataset_name, base_dir="results"):
+    """
+    Create or append results to a dataset-specific CSV file.
+    
+    Args:
+        config (dict): Configuration parameters
+        metrics (dict): Dictionary containing metrics (means and standard deviations)
+        dataset_name (str): Name of the dataset
+        base_dir (str): Base directory for results
+    """
+    csv_path = get_csv_path(dataset_name, base_dir)
+    file_exists = os.path.exists(csv_path)
+    
+    # Prepare the row data
+    row_data = {
+        # Key parameters that might be varied
+        'lamb': config['lamb'],
+        'temperature': config['temperature'],
+        'feature_noise': config['feature_noise'],
+        'hidden_dim': config['hidden_dim'],
+        'num_layers': config['num_layers'],
+        'learning_rate': config['learning_rate'],
+        'weight_decay': config['weight_decay'],
+        
+        # Model identification (constant across runs)
+        'teacher': config['teacher'],
+        'student': config['student'],
+        'dataset': config['dataset'],
+        'exp_setting': config['exp_setting'],
+        
+        # Feature distillation settings
+        'feat_distill': config.get('feat_distill', False),
+        'feat_distill_weight': config.get('feat_distill_weight', None),
+        'teacher_emb_layers': '_'.join(map(str, config.get('teacher_emb_layers', [-1]))),
+        'student_emb_layers': '_'.join(map(str, config.get('student_emb_layers', [-1]))),
+        'feat_distill_weights': '_'.join(map(str, config.get('feat_distill_weights', [-1]))),
+    }
+    # Add metrics
+    row_data.update(metrics)
+    
+    # Write to CSV
+    with open(csv_path, mode='a' if file_exists else 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(row_data.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row_data)
+
+
+def compute_metrics_statistics(metrics_list):
+    """
+    Compute mean and standard deviation for each metric across multiple runs.
+    
+    Args:
+        metrics_list (list): List of dictionaries containing metrics from each run
+    
+    Returns:
+        dict: Dictionary containing mean and std for each metric
+    """
+    metrics_arrays = {
+        key: np.array([run_metrics[key] for run_metrics in metrics_list])
+        for key in metrics_list[0].keys()
+    }
+    
+    stats = {}
+    for key, values in metrics_arrays.items():
+        stats[f'{key}_mean'] = float(np.mean(values))
+        stats[f'{key}_std'] = float(np.std(values))
+    
+    return stats
 
 
 def get_args():
@@ -42,6 +128,9 @@ def get_args():
     )
     parser.add_argument(
         "--output_path", type=str, default="outputs", help="Path to save outputs"
+    )
+    parser.add_argument(
+        "--results_dir", type=str, default="results", help="Directory to save CSV results"
     )
     parser.add_argument(
         "--num_exp", type=int, default=1, help="Repeat how many experiments"
@@ -209,7 +298,7 @@ def get_args():
     parser.add_argument(
         "--teacher_emb_layers",
         nargs="*",
-        default=[-1],
+        default=[-2],
         type=int,
         help="Layers for which teacher embeddings are saved (0 indexed)"
     )
@@ -234,7 +323,6 @@ def get_args():
 
 global_trans_dw_feature = None
 
-
 def get_features_dw(adj, device, is_transductive, args):
     if args.dataset == 'ogbn-products' or args.dataset == 'ogbn-arxiv':
         print('getting dw for ogbn-arxiv/ogbn-products ...')
@@ -243,8 +331,8 @@ def get_features_dw(adj, device, is_transductive, args):
         adj = np.asarray(adj.cpu())
         G = nx.Graph(adj)
 
-    model_emb = DeepWalk(G, walk_length=args.dw_walk_length, num_walks=args.dw_num_walks, workers=1)
-    model_emb.train(window_size=args.dw_window_size, iter=args.dw_iter, embed_size=args.dw_emb_size)
+    model_emb = DeepWalk(G, walk_length=args.dw_walk_length, num_walks=args.dw_num_walks, workers=4)
+    model_emb.train(window_size=args.dw_window_size, iter=args.dw_iter, embed_size=args.dw_emb_size, workers=4)
 
     emb = model_emb.get_embeddings()  # get embedding vectors
     embeddings = []
@@ -609,18 +697,23 @@ def run(args):
     logits_temp_t = logits_t/args.temperature
     out_t = load_out_t(out_t_dir)
     out_emb_t = []
-    if args.teacher_emb_layers != [-1]:
+
+    if args.teacher_emb_layers != [-2]:
+        print("here")
         for layer_num in args.teacher_emb_layers:
             out_emb_t.append(load_out_emb_t(out_t_dir, layer_num).to(device))
-    logger.info(
-        f"teacher score on train data: {evaluator(out_t[idx_train], labels[idx_train])}"
-    )
-    logger.info(
-        f"teacher score on val data: {evaluator(out_t[idx_val], labels[idx_val])}"
-    )
-    logger.info(
-        f"teacher score on test data: {evaluator(out_t[idx_test], labels[idx_test])}"
-    )
+
+    # Calculate teacher scores and metrics
+    teacher_test_score = evaluator(out_t[idx_test], labels[idx_test])
+    teacher_test_ece = compute_ece(torch.softmax(out_t[idx_test], dim=1), labels[idx_test])
+    teacher_test_ace = compute_adaptive_ece(torch.softmax(out_t[idx_test], dim=1), labels[idx_test])
+    teacher_test_brier = compute_brier_score(torch.softmax(out_t[idx_test], dim=1), labels[idx_test], args.label_dim)
+    
+    logger.info(f"Teacher metrics on test data:")
+    logger.info(f"  Score: {teacher_test_score:.4f}")
+    logger.info(f"  ECE: {teacher_test_ece:.4f}")
+    logger.info(f"  ACE: {teacher_test_ace:.4f}")
+    logger.info(f"  Brier: {teacher_test_brier:.4f}")
 
     """Data split and run"""
     loss_and_score = []
@@ -693,10 +786,18 @@ def run(args):
 
 
 def repeat_run(args):
+    # Lists for student metrics
     scores = []
     eces = []
     aces = []
     briers = []
+    
+    # Lists for teacher metrics
+    teacher_scores = []
+    teacher_eces = []
+    teacher_aces = []
+    teacher_briers = []
+    
     for seed in range(args.num_exp):
         if seed == 0:
             cal_dw_flag = True
@@ -704,17 +805,73 @@ def repeat_run(args):
             cal_dw_flag = False
         args.cal_dw_flag = cal_dw_flag
         args.seed = seed
-        temp_score, temp_ece, temp_ace, temp_brier  = run(args)
+        temp_score, temp_ece, temp_ace, temp_brier = run(args)
+        
+        # Student metrics
         scores.append(temp_score)
         eces.append(temp_ece)
         aces.append(temp_ace)
         briers.append(temp_brier)
+        
+        # Load teacher output for this seed
+        if args.exp_setting == "tran":
+            out_t_dir = Path.cwd().joinpath(
+                args.out_t_path,
+                "transductive",
+                args.dataset,
+                args.teacher,
+                f"seed_{args.seed}",
+            )
+        else:
+            out_t_dir = Path.cwd().joinpath(
+                args.out_t_path,
+                "inductive",
+                f"split_rate_{args.split_rate}",
+                args.dataset,
+                args.teacher,
+                f"seed_{args.seed}",
+            )
+            
+        # Load and evaluate teacher
+        out_t = load_out_t(out_t_dir)
+        _, labels, idx_train, idx_val, idx_test = load_data(
+            args.dataset,
+            args.data_path,
+            split_idx=args.split_idx,
+            seed=args.seed,
+            labelrate_train=args.labelrate_train,
+            labelrate_val=args.labelrate_val,
+        )
+        
+        if torch.cuda.is_available() and args.device >= 0:
+            device = torch.device("cuda:" + str(args.device))
+            labels = labels.to(device)
+            out_t = out_t.to(device)
+        
+        evaluator = get_evaluator(args.dataset)
+        teacher_test_score = evaluator(out_t[idx_test], labels[idx_test])
+        teacher_test_ece = compute_ece(torch.softmax(out_t[idx_test], dim=1), labels[idx_test])
+        teacher_test_ace = compute_adaptive_ece(torch.softmax(out_t[idx_test], dim=1), labels[idx_test])
+        teacher_test_brier = compute_brier_score(torch.softmax(out_t[idx_test], dim=1), labels[idx_test], args.label_dim)
+        
+        teacher_scores.append(teacher_test_score)
+        teacher_eces.append(teacher_test_ece)
+        teacher_aces.append(teacher_test_ace)
+        teacher_briers.append(teacher_test_brier)
 
+    # Convert to numpy arrays and compute statistics
     scores_np = np.array(scores)
     eces_np = np.array(eces)
     aces_np = np.array(aces)
     briers_np = np.array(briers)
+    
+    teacher_scores_np = np.array(teacher_scores)
+    teacher_eces_np = np.array(teacher_eces)
+    teacher_aces_np = np.array(teacher_aces)
+    teacher_briers_np = np.array(teacher_briers)
+    
     return (
+        # Student metrics
         scores_np.mean(axis=0),
         scores_np.std(axis=0),
         eces_np.mean(axis=0),
@@ -722,7 +879,16 @@ def repeat_run(args):
         aces_np.mean(axis=0),
         aces_np.std(axis=0),
         briers_np.mean(axis=0),
-        briers_np.std(axis=0)
+        briers_np.std(axis=0),
+        # Teacher metrics
+        teacher_scores_np.mean(),
+        teacher_scores_np.std(),
+        teacher_eces_np.mean(),
+        teacher_eces_np.std(),
+        teacher_aces_np.mean(),
+        teacher_aces_np.std(),
+        teacher_briers_np.mean(),
+        teacher_briers_np.std()
     )
     
 def main():
@@ -730,6 +896,7 @@ def main():
     assert args.num_exp > 1
 
     (
+        # Student metrics
         score_mean,
         score_std,
         ece_mean,
@@ -738,50 +905,111 @@ def main():
         ace_std,
         brier_mean,
         brier_std,
+        # Teacher metrics
+        teacher_score_mean,
+        teacher_score_std,
+        teacher_ece_mean,
+        teacher_ece_std,
+        teacher_ace_mean,
+        teacher_ace_std,
+        teacher_brier_mean,
+        teacher_brier_std
     ) = repeat_run(args)
 
-    score_str = "".join(
-        [f"{score_mean : .4f}\t"] + [f"{score_std : .4f}\t"]
+    # Print results
+    print("\nTeacher Results:")
+    print(f"Score Mean and Std: {teacher_score_mean:.4f} ± {teacher_score_std:.4f}")
+    print(f"ECE Mean and Std: {teacher_ece_mean:.4f} ± {teacher_ece_std:.4f}")
+    print(f"ACE Mean and Std: {teacher_ace_mean:.4f} ± {teacher_ace_std:.4f}")
+    print(f"Brier Mean and Std: {teacher_brier_mean:.4f} ± {teacher_brier_std:.4f}")
+    
+    print(f"\nStudent Results ({args.exp_setting}):")
+    print(f"Score Mean and Std: {score_mean:.4f} ± {score_std:.4f}")
+    print(f"ECE Mean and Std: {ece_mean:.4f} ± {ece_std:.4f}")
+    print(f"ACE Mean and Std: {ace_mean:.4f} ± {ace_std:.4f}")
+    print(f"Brier Mean and Std: {brier_mean:.4f} ± {brier_std:.4f}")
+
+    # Prepare metrics dictionary (averages across seeds)
+    metrics = {
+        # Student metrics (averaged over seeds)
+        'accuracy': float(score_mean),
+        'accuracy_std': float(score_std),
+        'ece': float(ece_mean),
+        'ece_std': float(ece_std),
+        'ace': float(ace_mean),
+        'ace_std': float(ace_std),
+        'brier': float(brier_mean),
+        'brier_std': float(brier_std),
+        # Teacher metrics (averaged over seeds)
+        'teacher_accuracy': float(teacher_score_mean),
+        'teacher_accuracy_std': float(teacher_score_std),
+        'teacher_ece': float(teacher_ece_mean),
+        'teacher_ece_std': float(teacher_ece_std),
+        'teacher_ace': float(teacher_ace_mean),
+        'teacher_ace_std': float(teacher_ace_std),
+        'teacher_brier': float(teacher_brier_mean),
+        'teacher_brier_std': float(teacher_brier_std),
+        # Number of seeds used for averaging
+        'num_seeds': args.num_exp
+    }
+
+    # Prepare config dictionary with all hyperparameters
+    config = {
+        # Experiment settings
+        'dataset': args.dataset,
+        'exp_setting': args.exp_setting,
+        'seed': args.seed,
+        
+        # Model architecture
+        'teacher': args.teacher,
+        'student': args.student,
+        'num_layers': args.num_layers,
+        'hidden_dim': args.hidden_dim,
+        
+        # Training hyperparameters
+        'learning_rate': args.learning_rate,
+        'weight_decay': args.weight_decay,
+        'temperature': args.temperature,
+        'lamb': args.lamb,
+        'patience': args.patience,
+        'max_epoch': args.max_epoch,
+        
+        # Feature parameters
+        'feature_noise': args.feature_noise,
+        'feat_distill': args.feat_distill,
+        'feat_distill_weight': getattr(args, 'feat_distill_weight', None),
+        
+        # Layer configurations
+        'teacher_emb_layers': args.teacher_emb_layers,
+        'student_emb_layers': args.student_emb_layers,
+        'feat_distill_weights': args.feat_distill_weights,
+        
+        # Additional parameters
+        'norm_type': args.norm_type,
+        'batch_size': args.batch_size,
+        'labelrate_train': args.labelrate_train,
+        'labelrate_val': args.labelrate_val,
+        'teacher_logits': args.teacher_logits,
+        
+        # DW parameters
+        'dw': args.dw,
+        'dw_walk_length': getattr(args, 'dw_walk_length', None),
+        'dw_num_walks': getattr(args, 'dw_num_walks', None),
+        'dw_window_size': getattr(args, 'dw_window_size', None),
+        'dw_iter': getattr(args, 'dw_iter', None),
+        'dw_emb_size': getattr(args, 'dw_emb_size', None)
+    }
+
+    # Save to dataset-specific CSV
+    create_or_append_to_csv(
+        config=config,
+        metrics=metrics,
+        dataset_name=args.dataset,
+        base_dir=args.results_dir
     )
-    if args.exp_setting == "tran":
-        print("Score Mean and Std: ", score_mean, ", ", score_std)
-        print("ECE Mean and Std: ", ece_mean, ", ", ece_std)
-        print("ACE Mean and Std: ", ace_mean, ", ", ace_std)
-        print("Brier Mean and Std: ", brier_mean, ", ", brier_std)
 
-        data = [[args.teacher_logits, args.temperature, score_mean, ece_mean, ace_mean, brier_mean]]
-        filename = args.output_dir.parent.joinpath("output.csv")
-        new_row = pd.DataFrame(data, columns=["Teacher Logits", "Temperature", "Score", "ECE", "ACE", "Brier"])
-        
-        if os.path.isfile(filename):
-            new_row.to_csv(filename, mode="a", header=False, index=False)
-        else:
-            new_row.to_csv(filename, mode="w", header=True, index=False)
-            
-    if args.exp_setting == 'ind':
-        print("Score Mean and Std (test_ind): ", score_mean, ", ", score_std)
-        print("ECE Mean and Std (test_ind): ", ece_mean, ", ", ece_std)
-        print("ACE Mean and Std (test_ind): ", ace_mean, ", ", ace_std)
-        print("Brier Mean and Std (test_ind): ", brier_mean, ", ", brier_std)
-                
-        # score_prod = score_mean[0] * 0.8 + score_mean[1] * 0.2
-        # ece_prod = ece_mean[0] * 0.8 + ece_mean[1] * 0.2
-        # ace_prod = ace_mean[0] * 0.8 + ace_mean[1] * 0.2
-        # brier_prod = brier_mean[0] * 0.8 + brier_mean[1] * 0.2
-        # print("Score Prod Mean: ", score_prod)
-        # print("ECE Prod Mean: ", ece_prod)
-        # print("ACE Prod Mean: ", ace_prod)
-        # print("Brier Prod Mean: ", brier_prod)
-
-        data = [[args.teacher_logits, args.temperature, score_mean, ece_mean, ace_mean, brier_mean]]
-        filename = args.output_dir.parent.joinpath("output.csv")
-        new_row = pd.DataFrame(data, columns=["Teacher Logits", "Temperature", "Score (test_ind)", "ECE (test_ind)", "ACE (test_ind)", "Brier (test_ind)"])
-        
-        if os.path.isfile(filename):
-            new_row.to_csv(filename, mode="a", header=False, index=False)
-        else:
-            new_row.to_csv(filename, mode="w", header=True, index=False)
-
+    # Keep the original exp_results file for backward compatibility
+    score_str = "".join([f"{score_mean:.4f}\t"] + [f"{score_std:.4f}\t"])
     with open(args.output_dir.parent.joinpath("exp_results"), "a+") as f:
         f.write(f"{score_str}\n")
 

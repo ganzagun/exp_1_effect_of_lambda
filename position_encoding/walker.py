@@ -4,6 +4,7 @@ import random
 
 import pandas as pd
 from joblib import Parallel, delayed
+from tqdm import tqdm
 
 from .alias import alias_sample, create_alias_table
 from .utils import partition_num
@@ -112,10 +113,12 @@ class RandomWalker:
         G = self.G
 
         nodes = list(G.nodes())
+        
+        print(f"Generating random walks: {num_walks} walks per node, walk length: {walk_length}")
 
         results = Parallel(n_jobs=workers, verbose=verbose, )(
             delayed(self._simulate_walks)(nodes, num, walk_length) for num in
-            partition_num(num_walks, workers))
+            tqdm(partition_num(num_walks, workers), desc="Random walk generation", leave=True))
 
         walks = list(itertools.chain(*results))
         # print('walks: ', walks[0])

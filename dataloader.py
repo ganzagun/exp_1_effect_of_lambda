@@ -1,5 +1,6 @@
 import numpy as np
 import scipy.sparse as sp
+import scipy.io as io
 import torch
 import dgl
 import os
@@ -51,7 +52,7 @@ def load_data(dataset, dataset_path, **kwargs):
             kwargs["labelrate_train"],
             kwargs["labelrate_val"]
         )
-    else
+    else:
         raise ValueError(f"Unknown dataset: {dataset}")
     
 def load_graph(graph_path):
@@ -144,21 +145,66 @@ def load_cpf_data(dataset, dataset_path, seed, labelrate_train, labelrate_val):
 
 def load_actor_data(dataset, dataset_path, seed, labelrate_train, labelrate_val):
     """
-    Load Actor dataset (prefers {dataset}.npz in dataset_path, else loads DGL ActorDataset).
+    Load Actor dataset from local files following DGL ActorDataset processing.
     Returns:
         g: DGLGraph
         labels: torch.LongTensor (n,)
         idx_train, idx_val, idx_test: torch.LongTensor
     """
-    # Try to load .npz like your CPF loader expects
-    data_path = Path.cwd().joinpath(dataset_path, f"{dataset}.npz")
+    # Process node features and labels from the text file
+    features_path = os.path.join(dataset_path, "actor", "out1_node_feature_label.txt")
+    # print(features_path)
+    with open(features_path, "r") as f:
+        data = [x.split("\t") for x in f.read().split("\n")[1:-1]]
+       
+        
+        rows, cols = [], []
+        labels = torch.empty(len(data), dtype=torch.long)
+        for n_id, col, label in data:
+            col = [int(x) for x in col.split(",")]
+            rows += [int(n_id)] * len(col)
+            cols += col
+            labels[int(n_id)] = int(label)
+            
+        row, col = torch.tensor(rows), torch.tensor(cols)
+        features = torch.zeros(len(data), int(col.max()) + 1)
+        features[row, col] = 1.0
 
-    ds = ActorDataset()
-    g0 = ds[0]
+ 
+    # Process graph structure from edges file
+    edges_path = os.path.join(dataset_path, "actor", "out1_graph_edges.txt")
+    with open(edges_path, "r") as f:
+        data = f.read().split("\n")[1:-1]
+        data = [[int(v) for v in r.split("\t")] for r in data]
+    dst, src = torch.tensor(data, dtype=torch.long).t().contiguous()
+
+    # Create DGL graph
+    g0 = dgl.graph((src, dst), num_nodes=features.size(0))
+    g0.ndata["feat"] = features
+    g0.ndata["label"] = labels
+    
+
+    # Load train/val/test split from npz file for the given seed
+    split_path = os.path.join(dataset_path, "actor", f"actor_split_0.6_0.2_{seed}.npz")
+    split_data = np.load(split_path)
+    idx_train = torch.from_numpy(split_data["train_mask"]).nonzero().squeeze()
+    idx_val = torch.from_numpy(split_data["val_mask"]).nonzero().squeeze()
+    idx_test = torch.from_numpy(split_data["test_mask"]).nonzero().squeeze()
+
+
+    # Save node features and labels before graph operations
+    saved_feat = g0.ndata['feat']
+    saved_label = g0.ndata['label']
+
     # ensure graph is undirected and has self-loops
     g0 = dgl.to_simple(dgl.to_bidirected(g0))
     g0 = dgl.remove_self_loop(g0)
     g0 = dgl.add_self_loop(g0)
+
+    # Restore node features and labels
+    g0.ndata['feat'] = saved_feat
+    g0.ndata['label'] = saved_label
+
 
     # build scipy sparse adj from edges
     src, dst = g0.edges()
@@ -167,6 +213,7 @@ def load_actor_data(dataset, dataset_path, seed, labelrate_train, labelrate_val)
     n_nodes = g0.num_nodes()
     adj = sp.coo_matrix((np.ones_like(src), (src, dst)), shape=(n_nodes, n_nodes)).tocsr()
 
+    
     # features and labels
     features = g0.ndata.get("feat")
     if isinstance(features, torch.Tensor):
@@ -213,14 +260,14 @@ def load_actor_data(dataset, dataset_path, seed, labelrate_train, labelrate_val)
 
 def load_fraudamazon_data(dataset, dataset_path, seed, labelrate_train, labelrate_val):
     """
-    Load FraudAmazon graph dataset.
+    Load FraudAmazon graph dataset from local files.
 
     Parameters
     ----------
     dataset : str
         Name used for npz filename (e.g., "fraud_amazon" or "amazon_fraud").
     dataset_path : str
-        Directory containing `{dataset}.npz`. If not present, the function will attempt to use DGL's FraudAmazonDataset.
+        Directory containing Amazon.mat file.
     seed : int
         Random seed for deterministic splits.
     labelrate_train, labelrate_val : float in (0,1] or int >=1
@@ -235,19 +282,71 @@ def load_fraudamazon_data(dataset, dataset_path, seed, labelrate_train, labelrat
     idx_train, idx_val, idx_test : torch.LongTensor
         Index tensors for splits.
     """
-    ds = FraudAmazonDataset()
-    g0 = ds[0]
+    # print("Loading FraudAmazon dataset...")
+    
+    # Load the .mat file
+    file_path = os.path.join(dataset_path, "Amazon.mat")
+    # print(f"Loading data from {file_path}")
+    data = io.loadmat(file_path)
+    
+    # Extract features and labels
+    # print("Processing node features and labels...")
+    node_features = data["features"].todense()
+    node_labels = data["label"].squeeze()
+    # print(f"Node features shape: {node_features.shape}, Labels shape: {node_labels.shape}")
+    
+    # Build graph from the three relations
+    # print("\nProcessing graph relations...")
+    relations = ["net_upu", "net_usu", "net_uvu"]
+    edges_list = []
+    for relation in relations:
+        # print(f"Processing relation: {relation}")
+        adj = data[relation].tocoo()
+        edges_list.append((adj.row, adj.col))
+        # print(f"- {relation}: {len(adj.row)} edges")
+    
+    # Combine all edges
+    # print("\nCombining edges from all relations...")
+    all_src = np.concatenate([e[0] for e in edges_list])
+    all_dst = np.concatenate([e[1] for e in edges_list])
+    # print(f"Total edges in combined graph: {len(all_src)}")
+    
+    # Create DGL graph
+    # print("\nCreating DGL graph...")
+    g0 = dgl.graph((all_src, all_dst), num_nodes=node_features.shape[0])
+    g0.ndata["feat"] = torch.FloatTensor(node_features)
+    g0.ndata["label"] = torch.LongTensor(node_labels)
+    # print(f"Initial graph: {g0}")
     # make undirected / simple and add self-loops
-    g0 = dgl.to_simple(dgl.to_bidirected(g0))
-    g0 = dgl.remove_self_loop(g0)
-    g0 = dgl.add_self_loop(g0)
+    # Save node features before graph operations
+    saved_feat = g0.ndata['feat']
+    saved_label = g0.ndata['label']
 
+    # print("\nTransforming graph...")
+    # print("1. Making graph bidirectional and simple...")
+    g0 = dgl.to_simple(dgl.to_bidirected(g0))
+    # print(f"After bidirectional: {g0}")
+    
+    # print("2. Removing self-loops...")
+    g0 = dgl.remove_self_loop(g0)
+    # print("3. Adding self-loops...")
+    g0 = dgl.add_self_loop(g0)
+    # print(f"Final graph structure: {g0}")
+
+    # print("4. Restoring node features...")
+    g0.ndata['feat'] = saved_feat
+    g0.ndata['label'] = saved_label
+
+    # build scipy sparse adj from edges
     src, dst = g0.edges()
     src = src.numpy()
     dst = dst.numpy()
     n_nodes = g0.num_nodes()
     adj = sp.coo_matrix((np.ones_like(src), (src, dst)), shape=(n_nodes, n_nodes)).tocsr()
 
+    # print("\nPreparing train/val/test splits...")
+    
+    # Get features and labels
     features = g0.ndata.get("feat")
     if isinstance(features, torch.Tensor):
         features = features.numpy()
@@ -259,13 +358,50 @@ def load_fraudamazon_data(dataset, dataset_path, seed, labelrate_train, labelrat
     if not sp.issparse(adj):
         adj = sp.csr_matrix(adj)
 
-    # binarize (one-hot) for split routine
-    labels_onehot = binarize_labels(labels_arr)
-
-    rng = np.random.RandomState(seed)
-    idx_train_list, idx_val_list, idx_test_list = get_train_val_test_split(
-        rng, labels_onehot, labelrate_train, labelrate_val
-    )
+    # Note: nodes 0-3304 are unlabeled in the Amazon dataset
+    # We'll split the labeled nodes (3305 onwards) into train/val/test
+    
+    labeled_nodes = np.arange(3305, len(labels_arr))
+    np.random.seed(seed)  # Set seed for reproducibility
+    np.random.shuffle(labeled_nodes)
+    
+    # Split ratios similar to ogbn-arxiv (54/18/28)
+    n_labeled = len(labeled_nodes)
+    train_ratio, val_ratio = 0.54, 0.18
+    
+    train_end = int(n_labeled * train_ratio)
+    val_end = int(n_labeled * (train_ratio + val_ratio))
+    
+    idx_train_list = labeled_nodes[:train_end]
+    idx_val_list = labeled_nodes[train_end:val_end]
+    idx_test_list = labeled_nodes[val_end:]
+    
+    # print(f"\nSplit Statistics:")
+    # print(f"Number of labeled nodes: {n_labeled}")
+    # print(f"Train/Val/Test splits: {len(idx_train_list)}/{len(idx_val_list)}/{len(idx_test_list)}")
+    
+    # Analyze label distribution
+    # print("\nLabel Distribution:")
+    
+    def get_label_stats(indices):
+        if len(indices) == 0:
+            return {}
+        labels = labels_arr[indices]
+        unique, counts = np.unique(labels, return_counts=True)
+        return dict(zip(unique, counts))
+    
+    train_dist = get_label_stats(idx_train_list)
+    val_dist = get_label_stats(idx_val_list)
+    test_dist = get_label_stats(idx_test_list)
+    
+    # print("\nClass | Train |  Val  | Test  | Total")
+    # print("-" * 40)
+    for label in sorted(set(labels_arr[labeled_nodes])):
+        train_count = train_dist.get(label, 0)
+        val_count = val_dist.get(label, 0)
+        test_count = test_dist.get(label, 0)
+        total = train_count + val_count + test_count
+        # print(f"{label:5d} | {train_count:5d} | {val_count:5d} | {test_count:5d} | {total:5d}")
 
     # Normalize adjacency and build DGL graph
     adj_norm = normalize_adj(adj)  # COO
@@ -278,6 +414,7 @@ def load_fraudamazon_data(dataset, dataset_path, seed, labelrate_train, labelrat
     features = np.array(features)
     g.ndata["feat"] = torch.FloatTensor(features)
 
+    # print("\nPreparing final outputs...")
     # Labels as integer LongTensor
     labels_tensor = torch.LongTensor(np.array(labels_arr).astype(np.int64).reshape(-1))
 
@@ -285,6 +422,9 @@ def load_fraudamazon_data(dataset, dataset_path, seed, labelrate_train, labelrat
     idx_train = torch.LongTensor(idx_train_list)
     idx_val = torch.LongTensor(idx_val_list)
     idx_test = torch.LongTensor(idx_test_list)
+
+    # print(f"\nSplit sizes: Train: {len(idx_train)}, Val: {len(idx_val)}, Test: {len(idx_test)}")
+    # print("FraudAmazon dataset loading completed!")
 
     return g, labels_tensor, idx_train, idx_val, idx_test
 
